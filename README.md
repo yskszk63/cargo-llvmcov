@@ -16,7 +16,7 @@ Installation
 ```
 rustup component add --toolchain nightly llvm-tools-preview
 cargo install rustfilt
-cargo install --git https://github.com/yskszk63/cargo-llvmcov cargo-llvmcov
+cargo install --git https://github.com/yskszk63/cargo-llvmcov --branch main cargo-llvmcov
 ```
 
 Usage
