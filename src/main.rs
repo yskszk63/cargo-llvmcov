@@ -417,27 +417,34 @@ fn llvm_cov_export(
 #[derive(Debug, Clap)]
 #[clap(bin_name = "cargo", version = env!("CARGO_PKG_VERSION"), after_long_help = option_env!("RUSTFLAGS").unwrap_or_default())]
 pub enum SubCommand {
+    /// A utility for report LLVM Source-based code coverage.
     Llvmcov(Opts),
 }
 
 #[derive(Debug, Clap)]
 #[clap(version = env!("CARGO_PKG_VERSION"))]
 pub struct Opts {
+    /// Generate lcov report.
     #[clap(short = 'l', long, conflicts_with_all = &["html", "lcov-output"])]
     lcov: bool,
 
+    /// Lcov output file name.
     #[clap(short = 'L', long)]
     lcov_output: Option<PathBuf>,
 
-    #[clap(short = 'h', long, conflicts_with_all = &["lcov", "lcov-output"])]
+    /// Generate HTML report.
+    #[clap(short = 'H', long, conflicts_with_all = &["lcov", "lcov-output"])]
     html: bool,
 
+    /// Open HTML report when done.
     #[clap(short = 'o', long, requires = "html")]
     open: bool,
 
+    /// Keep default.profdata & *.profraw
     #[clap(short = 'k', long)]
     keep: bool,
 
+    /// Verbose output.
     #[clap(short = 'v', long, parse(from_occurrences))]
     verbose: usize,
 }
