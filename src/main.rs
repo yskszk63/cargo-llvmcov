@@ -2,6 +2,7 @@ use std::env;
 use std::ffi::OsStr;
 use std::fs;
 use std::io::{self, BufRead, BufReader};
+use std::mem;
 use std::path::{Path, PathBuf};
 use std::process::{
     self, Child as StdChild, ChildStdout as StdChildStdout, Command as StdCommand,
@@ -195,6 +196,46 @@ impl Command {
     }
 }
 
+#[derive(Debug)]
+struct Profenv {
+    profraw_dir: PathBuf,
+    profdata: PathBuf,
+}
+
+impl Profenv {
+    fn new(basedir: &Path) -> io::Result<Self> {
+        let profraw_dir = basedir.join(format!("profraw-{}", process::id()));
+        let profdata = basedir.join("default.profdata");
+        fs::create_dir(&profraw_dir)?;
+        Ok(Self {
+            profraw_dir,
+            profdata,
+        })
+    }
+
+    fn profraw(&self) -> PathBuf {
+        self.profraw_dir.join("%p.profraw")
+    }
+
+    fn profraw_files(&self) -> anyhow::Result<Vec<PathBuf>> {
+        let pattern = self.profraw_dir.join("*.profraw");
+        let result = glob::glob(pattern.to_string_lossy().as_ref())?.collect::<Result<_, _>>()?;
+        Ok(result)
+    }
+}
+
+impl Drop for Profenv {
+    fn drop(&mut self) {
+        log::debug!("remove profraw & profdata");
+        if let Err(e) = fs::remove_dir_all(&self.profraw_dir) {
+            log::warn!("failed to remove dir {}", e);
+        }
+        if let Err(e) = fs::remove_file(&self.profdata) {
+            log::warn!("failed to remove dir {}", e);
+        }
+    }
+}
+
 fn cargo() -> PathBuf {
     let cargo = env::var("CARGO").unwrap_or_else(|_| "cargo".to_owned());
     cargo.into()
@@ -214,7 +255,7 @@ fn target_dir(cargo: &Path) -> anyhow::Result<PathBuf> {
     Ok(metadata.target_directory)
 }
 
-fn build(cargo: &Path, target: &Path, profraw: &Path) -> anyhow::Result<Vec<PathBuf>> {
+fn build(cargo: &Path, target: &Path, profenv: &Profenv) -> anyhow::Result<Vec<PathBuf>> {
     let mut build_proc = Command::new(cargo)
         .arg("build")
         .arg("--message-format")
@@ -224,7 +265,7 @@ fn build(cargo: &Path, target: &Path, profraw: &Path) -> anyhow::Result<Vec<Path
         .arg(target)
         .env("RUSTC_BOOTSTRAP", "1")
         .env("RUSTFLAGS", "-Zinstrument-coverage")
-        .env("LLVM_PROFILE_FILE", &profraw)
+        .env("LLVM_PROFILE_FILE", &profenv.profraw())
         .stdout(Stdio::piped())
         .spawn()?;
 
@@ -256,10 +297,10 @@ fn build(cargo: &Path, target: &Path, profraw: &Path) -> anyhow::Result<Vec<Path
     Ok(executables)
 }
 
-fn run_test(prog: &Path, profraw: &Path) -> anyhow::Result<()> {
+fn run_test(prog: &Path, profenv: &Profenv) -> anyhow::Result<()> {
     let r = Command::new(&prog)
         .arg("--nocapture")
-        .env("LLVM_PROFILE_FILE", profraw)
+        .env("LLVM_PROFILE_FILE", profenv.profraw())
         .status()?;
     if !r.success() {
         anyhow::bail!("failed to run executable.");
@@ -267,16 +308,13 @@ fn run_test(prog: &Path, profraw: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn merge_profdata<'a, P>(llvm_profdata: &Path, profraws: P, profdata: &Path) -> anyhow::Result<()>
-where
-    P: IntoIterator<Item = &'a PathBuf>,
-{
+fn merge_profdata(llvm_profdata: &Path, profenv: &Profenv) -> anyhow::Result<()> {
     let result = Command::new(llvm_profdata)
         .arg("merge")
         .arg("-sparse")
-        .args(profraws)
+        .args(profenv.profraw_files()?)
         .arg("-o")
-        .arg(profdata)
+        .arg(&profenv.profdata)
         .status()?;
     if !result.success() {
         anyhow::bail!("failed to run llvm-profdata.");
@@ -300,7 +338,7 @@ fn to_obj_args<'a>(executables: &'a [PathBuf]) -> Vec<&'a OsStr> {
 fn llvm_cov_show(
     llvm_cov: &Path,
     rustfilt: &Path,
-    profdata: &Path,
+    profenv: &Profenv,
     executables: &[PathBuf],
     html_output: Option<&Path>,
     ignore: &str,
@@ -318,7 +356,10 @@ fn llvm_cov_show(
             rustfilt.to_string_lossy().as_ref()
         ))
         .args(to_obj_args(executables))
-        .arg(format!("-instr-profile={}", profdata.to_string_lossy()))
+        .arg(format!(
+            "-instr-profile={}",
+            profenv.profdata.to_string_lossy()
+        ))
         .arg(format!(
             "-format={}",
             if html_output.is_some() {
@@ -340,7 +381,7 @@ fn llvm_cov_show(
 fn llvm_cov_export(
     llvm_cov: &Path,
     rustfilt: &Path,
-    profdata: &Path,
+    profenv: &Profenv,
     executables: &[PathBuf],
     output: &Path,
     ignore: &str,
@@ -352,7 +393,10 @@ fn llvm_cov_export(
             rustfilt.to_string_lossy().as_ref()
         ))
         .args(to_obj_args(executables))
-        .arg(format!("-instr-profile={}", profdata.to_string_lossy()))
+        .arg(format!(
+            "-instr-profile={}",
+            profenv.profdata.to_string_lossy()
+        ))
         .arg("-format=lcov")
         .arg(format!("-ignore-filename-regex={}", ignore))
         .arg("-show-instantiations=false")
@@ -403,31 +447,27 @@ fn main() -> anyhow::Result<()> {
 
     stderrlog::new().verbosity(opts.verbose).init()?;
 
-    let cargo = cargo();
-    let target = target_dir(&cargo)?.join("cov");
     let llvm_profdata = Tool::Profdata.path()?;
     let llvm_cov = Tool::Cov.path()?;
     let rustfilt = which::which("rustfilt")?;
-    let profraw_dir = target.join(format!("profraw-{}", process::id()));
-    let profraw = profraw_dir.join("%p.profraw");
-    let executables = build(&cargo, &target, &profraw)?;
-    let profdata = target.join("default.profdata");
+
+    let cargo = cargo();
+    let target = target_dir(&cargo)?.join("cov");
+    fs::create_dir_all(&target)?;
+    let profenv = Profenv::new(&target)?;
+    let executables = build(&cargo, &target, &profenv)?;
 
     log::debug!("cargo binary: {:?}", cargo);
     log::debug!("output directory: {:?}", target);
     log::debug!("llvm-profdata: {:?}", llvm_profdata);
-    log::debug!("LLVM_PROFILE_FILE: {:?}", profraw);
     log::debug!("executables: {:?}", executables);
-
-    fs::create_dir_all(&profraw_dir)?;
+    log::debug!("LLVM_PROFILE_FILE: {:?}", profenv.profraw());
 
     for executable in &executables {
-        run_test(&executable, &profraw)?;
+        run_test(&executable, &profenv)?;
     }
 
-    let profraws = glob::glob(profraw_dir.join("*.profraw").to_string_lossy().as_ref())?
-        .collect::<Result<Vec<_>, _>>()?;
-    merge_profdata(&llvm_profdata, &profraws, &profdata)?;
+    merge_profdata(&llvm_profdata, &profenv)?;
 
     let cargo_home = cargo_home();
     let rustup_home = rustup_home();
@@ -439,7 +479,7 @@ fn main() -> anyhow::Result<()> {
             llvm_cov_export(
                 &llvm_cov,
                 &rustfilt,
-                &profdata,
+                &profenv,
                 &executables,
                 &target.join("cov.info"),
                 &cargo_home,
@@ -449,34 +489,25 @@ fn main() -> anyhow::Result<()> {
             lcov_output: Some(lcov),
             ..
         } => {
-            llvm_cov_export(
-                &llvm_cov,
-                &rustfilt,
-                &profdata,
-                &executables,
-                &lcov,
-                &ignore,
-            )?;
+            llvm_cov_export(&llvm_cov, &rustfilt, &profenv, &executables, &lcov, &ignore)?;
         }
         Opts { html: true, .. } => {
             llvm_cov_show(
                 &llvm_cov,
                 &rustfilt,
-                &profdata,
+                &profenv,
                 &executables,
                 Some(&target.join("html")),
                 &ignore,
             )?;
         }
         _ => {
-            llvm_cov_show(&llvm_cov, &rustfilt, &profdata, &executables, None, &ignore)?;
+            llvm_cov_show(&llvm_cov, &rustfilt, &profenv, &executables, None, &ignore)?;
         }
     }
 
-    if !opts.keep {
-        log::debug!("remove profraw & profdata");
-        fs::remove_dir_all(&profraw_dir)?;
-        fs::remove_file(&profdata)?;
+    if opts.keep {
+        mem::forget(profenv);
     }
 
     if opts.open {

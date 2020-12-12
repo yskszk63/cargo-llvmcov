@@ -110,13 +110,11 @@ fn test_build() {
 {"reason":"build-finished","success":true}
 "#, true)));
 
+    let tmpdir = mktemp::Temp::new_dir().unwrap();
+    let profenv = Profenv::new(&tmpdir).unwrap();
+
     begin_capture();
-    build(
-        &PathBuf::from("cargo"),
-        &PathBuf::from("target"),
-        &PathBuf::from("profraw"),
-    )
-    .unwrap();
+    build(&PathBuf::from("cargo"), &PathBuf::from("target"), &profenv).unwrap();
     assert_eq!(
         pop_captured().unwrap().message(),
         "CALL cargo build --message-format json --tests --target-dir target"
@@ -127,12 +125,10 @@ fn test_build() {
 fn test_build_failed() {
     MOCK_RESULT.with(|o| o.borrow_mut().replace((br#""#, false)));
 
-    let r = build(
-        &PathBuf::from("cargo"),
-        &PathBuf::from("target"),
-        &PathBuf::from("profraw"),
-    )
-    .unwrap_err();
+    let tmpdir = mktemp::Temp::new_dir().unwrap();
+    let profenv = Profenv::new(&tmpdir).unwrap();
+
+    let r = build(&PathBuf::from("cargo"), &PathBuf::from("target"), &profenv).unwrap_err();
     assert_eq!(&r.to_string(), "failed to run cargo build.");
 }
 
@@ -142,12 +138,10 @@ fn test_build_no_executable_found() {
 {"reason":"build-finished","success":true}
 "#, true)));
 
-    let r = build(
-        &PathBuf::from("cargo"),
-        &PathBuf::from("target"),
-        &PathBuf::from("profraw"),
-    )
-    .unwrap_err();
+    let tmpdir = mktemp::Temp::new_dir().unwrap();
+    let profenv = Profenv::new(&tmpdir).unwrap();
+
+    let r = build(&PathBuf::from("cargo"), &PathBuf::from("target"), &profenv).unwrap_err();
     assert_eq!(&r.to_string(), "no executable found.");
 }
 
@@ -155,8 +149,11 @@ fn test_build_no_executable_found() {
 fn test_run_test() {
     MOCK_RESULT.with(|o| o.borrow_mut().replace((br#""#, true)));
 
+    let tmpdir = mktemp::Temp::new_dir().unwrap();
+    let profenv = Profenv::new(&tmpdir).unwrap();
+
     begin_capture();
-    run_test(&PathBuf::from("program"), &PathBuf::from("profraw")).unwrap();
+    run_test(&PathBuf::from("program"), &profenv).unwrap();
     assert_eq!(
         pop_captured().unwrap().message(),
         "CALL program --nocapture"
@@ -167,7 +164,10 @@ fn test_run_test() {
 fn test_run_test_failed() {
     MOCK_RESULT.with(|o| o.borrow_mut().replace((br#""#, false)));
 
-    let r = run_test(&PathBuf::from("program"), &PathBuf::from("profraw")).unwrap_err();
+    let tmpdir = mktemp::Temp::new_dir().unwrap();
+    let profenv = Profenv::new(&tmpdir).unwrap();
+
+    let r = run_test(&PathBuf::from("program"), &profenv).unwrap_err();
     assert_eq!(&r.to_string(), "failed to run executable.");
 }
 
@@ -175,16 +175,17 @@ fn test_run_test_failed() {
 fn test_merge_profdata() {
     MOCK_RESULT.with(|o| o.borrow_mut().replace((br#""#, true)));
 
+    let tmpdir = mktemp::Temp::new_dir().unwrap();
+    let profenv = Profenv::new(&tmpdir).unwrap();
+
     begin_capture();
-    merge_profdata(
-        &PathBuf::from("llvm-profdata"),
-        vec![&PathBuf::from("profraw")],
-        &PathBuf::from("profdata"),
-    )
-    .unwrap();
+    merge_profdata(&PathBuf::from("llvm-profdata"), &profenv).unwrap();
     assert_eq!(
         pop_captured().unwrap().message(),
-        "CALL llvm-profdata merge -sparse profraw -o profdata"
+        format!(
+            "CALL llvm-profdata merge -sparse -o {}",
+            tmpdir.join("default.profdata").to_string_lossy()
+        ),
     );
 }
 
@@ -192,12 +193,10 @@ fn test_merge_profdata() {
 fn test_merge_profdata_failed() {
     MOCK_RESULT.with(|o| o.borrow_mut().replace((br#""#, false)));
 
-    let r = merge_profdata(
-        &PathBuf::from("llvm-profdata"),
-        vec![],
-        &PathBuf::from("profdata"),
-    )
-    .unwrap_err();
+    let tmpdir = mktemp::Temp::new_dir().unwrap();
+    let profenv = Profenv::new(&tmpdir).unwrap();
+
+    let r = merge_profdata(&PathBuf::from("llvm-profdata"), &profenv).unwrap_err();
     assert_eq!(&r.to_string(), "failed to run llvm-profdata.");
 }
 
@@ -223,44 +222,56 @@ fn test_to_obj_args() {
 fn test_llvm_cov_show() {
     MOCK_RESULT.with(|o| o.borrow_mut().replace((br#""#, true)));
 
+    let tmpdir = mktemp::Temp::new_dir().unwrap();
+    let profenv = Profenv::new(&tmpdir).unwrap();
+
     begin_capture();
     llvm_cov_show(
         &PathBuf::from("llvm-cov"),
         &PathBuf::from("rustfilt"),
-        &PathBuf::from("profdata"),
+        &profenv,
         &[PathBuf::from("exe")],
         None,
         "ignore",
     )
     .unwrap();
-    assert_eq!(pop_captured().unwrap().message(), "CALL llvm-cov show -Xdemangler=rustfilt exe -instr-profile=profdata -format=text -ignore-filename-regex=ignore -show-instantiations=false");
+    assert_eq!(
+        pop_captured().unwrap().message(),
+        format!("CALL llvm-cov show -Xdemangler=rustfilt exe -instr-profile={} -format=text -ignore-filename-regex=ignore -show-instantiations=false", tmpdir.join("default.profdata").to_string_lossy()));
 }
 
 #[test]
 fn test_llvm_cov_show_html() {
     MOCK_RESULT.with(|o| o.borrow_mut().replace((br#""#, true)));
 
+    let tmpdir = mktemp::Temp::new_dir().unwrap();
+    let profenv = Profenv::new(&tmpdir).unwrap();
+
     begin_capture();
     llvm_cov_show(
         &PathBuf::from("llvm-cov"),
         &PathBuf::from("rustfilt"),
-        &PathBuf::from("profdata"),
+        &profenv,
         &[PathBuf::from("exe")],
         Some(&PathBuf::from("output")),
         "ignore",
     )
     .unwrap();
-    assert_eq!(pop_captured().unwrap().message(), "CALL llvm-cov show -Xdemangler=rustfilt exe -instr-profile=profdata -format=html -output-dir=output -ignore-filename-regex=ignore -show-instantiations=false");
+    assert_eq!(pop_captured().unwrap().message(),
+        format!("CALL llvm-cov show -Xdemangler=rustfilt exe -instr-profile={} -format=html -output-dir=output -ignore-filename-regex=ignore -show-instantiations=false", tmpdir.join("default.profdata").to_string_lossy()));
 }
 
 #[test]
 fn test_llvm_cov_show_failed() {
     MOCK_RESULT.with(|o| o.borrow_mut().replace((br#""#, false)));
 
+    let tmpdir = mktemp::Temp::new_dir().unwrap();
+    let profenv = Profenv::new(&tmpdir).unwrap();
+
     let r = llvm_cov_show(
         &PathBuf::from("llvm-cov"),
         &PathBuf::from("rustfilt"),
-        &PathBuf::from("profdata"),
+        &profenv,
         &[PathBuf::from("exe")],
         None,
         "ignore",
@@ -275,17 +286,21 @@ fn test_llvm_cov_export() {
 
     MOCK_RESULT.with(|o| o.borrow_mut().replace((br#""#, true)));
 
+    let tmpdir = mktemp::Temp::new_dir().unwrap();
+    let profenv = Profenv::new(&tmpdir).unwrap();
+
     begin_capture();
     llvm_cov_export(
         &PathBuf::from("llvm-cov"),
         &PathBuf::from("rustfilt"),
-        &PathBuf::from("profdata"),
+        &profenv,
         &[PathBuf::from("exe")],
         &output,
         "ignore",
     )
     .unwrap();
-    assert_eq!(pop_captured().unwrap().message(), "CALL llvm-cov export -Xdemangler=rustfilt exe -instr-profile=profdata -format=lcov -ignore-filename-regex=ignore -show-instantiations=false");
+    assert_eq!(pop_captured().unwrap().message(),
+        format!("CALL llvm-cov export -Xdemangler=rustfilt exe -instr-profile={} -format=lcov -ignore-filename-regex=ignore -show-instantiations=false", tmpdir.join("default.profdata").to_string_lossy()));
 }
 
 #[test]
@@ -294,10 +309,13 @@ fn test_llvm_cov_export_failed() {
 
     MOCK_RESULT.with(|o| o.borrow_mut().replace((br#""#, false)));
 
+    let tmpdir = mktemp::Temp::new_dir().unwrap();
+    let profenv = Profenv::new(&tmpdir).unwrap();
+
     let r = llvm_cov_export(
         &PathBuf::from("llvm-cov"),
         &PathBuf::from("rustfilt"),
-        &PathBuf::from("profdata"),
+        &profenv,
         &[PathBuf::from("exe")],
         &output,
         "ignore",
