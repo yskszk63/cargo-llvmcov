@@ -9,6 +9,7 @@ use std::process::{
     Output as StdOutput, Stdio,
 };
 
+use anyhow::Context;
 use cargo_binutils::Tool;
 use cargo_metadata::Metadata;
 use clap::Clap;
@@ -447,15 +448,31 @@ fn main() -> anyhow::Result<()> {
 
     stderrlog::new().verbosity(opts.verbose).init()?;
 
-    let llvm_profdata = Tool::Profdata.path()?;
-    let llvm_cov = Tool::Cov.path()?;
-    let rustfilt = which::which("rustfilt")?;
+    let llvm_profdata = Tool::Profdata
+        .path()
+        .context("failed to get llvm-profdata path.")?;
+    if !llvm_profdata.exists() {
+        anyhow::bail!(
+            "No llvm-profdata exists.May be needs `rustup component add llvm-tools{-preview}?`"
+        );
+    }
+    let llvm_cov = Tool::Cov.path().context("failed to get llvm-cov path.")?;
+    if !llvm_cov.exists() {
+        anyhow::bail!(
+            "No llvm-cov exists.May be needs `rustup component add llvm-tools{-preview}?`"
+        );
+    }
+    let rustfilt = which::which("rustfilt")
+        .context("No rustfilt exists.May be needs `cargo install rustfilt`.")?;
 
     let cargo = cargo();
-    let target = target_dir(&cargo)?.join("cov");
-    fs::create_dir_all(&target)?;
+    let target = target_dir(&cargo)
+        .context("failed to get target directory.")?
+        .join("cov");
+    fs::create_dir_all(&target)
+        .with_context(|| format!("failed to create {}", target.to_string_lossy()))?;
     let profenv = Profenv::new(&target)?;
-    let executables = build(&cargo, &target, &profenv)?;
+    let executables = build(&cargo, &target, &profenv).context("failed to build executables.")?;
 
     log::debug!("cargo binary: {:?}", cargo);
     log::debug!("output directory: {:?}", target);
