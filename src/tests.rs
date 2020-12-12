@@ -157,7 +157,10 @@ fn test_run_test() {
 
     begin_capture();
     run_test(&PathBuf::from("program"), &PathBuf::from("profraw")).unwrap();
-    assert_eq!(pop_captured().unwrap().message(), "CALL program --nocapture");
+    assert_eq!(
+        pop_captured().unwrap().message(),
+        "CALL program --nocapture"
+    );
 }
 
 #[test]
