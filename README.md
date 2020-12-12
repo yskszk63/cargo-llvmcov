@@ -23,22 +23,23 @@ Usage
 -----
 
 ```
-cargo-llvmcov
+cargo-llvmcov 0.1.0
+A utility for report LLVM Source-based code coverage
 
 USAGE:
-    llvmcov [FLAGS] [OPTIONS]
+    cargo llvmcov [FLAGS] [OPTIONS]
 
 FLAGS:
-        --help       Prints help information
-    -h, --html
-    -k, --keep
-    -l, --lcov
-    -o, --open
-    -v, --verbose
+    -h, --help       Prints help information
+    -H, --html       Generate HTML report
+    -k, --keep       Keep default.profdata & *.profraw
+    -l, --lcov       Generate lcov report
+    -o, --open       Open HTML report when done
+    -v, --verbose    Verbose output
     -V, --version    Prints version information
 
 OPTIONS:
-    -L, --lcov-output <lcov-output>
+    -L, --lcov-output <lcov-output>    Lcov output file name
 ```
 
 License
