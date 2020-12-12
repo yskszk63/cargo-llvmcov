@@ -3,18 +3,29 @@ use std::ffi::OsStr;
 use std::fs;
 use std::io::{self, BufRead, BufReader};
 use std::path::{Path, PathBuf};
-use std::process::{Command as StdCommand, Stdio, Output, Child, ExitStatus};
+use std::process::{
+    self, Child as StdChild, ChildStdout as StdChildStdout, Command as StdCommand,
+    Output as StdOutput, Stdio,
+};
 
 use cargo_binutils::Tool;
 use cargo_metadata::Metadata;
 use clap::Clap;
 
-#[derive(Debug, serde::Deserialize)]
+#[cfg(test)]
+mod tests;
+
+#[derive(Debug, PartialEq, Eq, serde::Deserialize)]
 struct BuildTarget {
     test: bool,
 }
 
-#[derive(Debug, serde::Deserialize)]
+#[derive(Debug, PartialEq, Eq, serde::Deserialize)]
+struct BuildProfile {
+    test: bool,
+}
+
+#[derive(Debug, PartialEq, Eq, serde::Deserialize)]
 #[serde(tag = "reason")]
 enum BuildMessage {
     #[serde(rename = "compiler-message")]
@@ -23,6 +34,7 @@ enum BuildMessage {
     #[serde(rename = "compiler-artifact")]
     CompilerArtifact {
         target: BuildTarget,
+        profile: BuildProfile,
         executable: Option<PathBuf>,
     },
 
@@ -33,6 +45,79 @@ enum BuildMessage {
     BuildFinished { success: bool },
 }
 
+#[cfg(test)]
+std::thread_local! {
+    static MOCK_RESULT: std::cell::RefCell<Option<(&'static [u8], bool)>> = std::cell::RefCell::new(None);
+}
+
+#[derive(Debug)]
+enum Output {
+    Actual(StdOutput),
+    #[cfg(test)]
+    Mock(Vec<u8>, bool),
+}
+
+impl Output {
+    fn stdout(&self) -> &[u8] {
+        match self {
+            Self::Actual(output) => &output.stdout,
+            #[cfg(test)]
+            Self::Mock(output, _) => &output,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct ExitStatus(bool);
+
+impl ExitStatus {
+    fn success(&self) -> bool {
+        self.0
+    }
+}
+
+#[derive(Debug)]
+enum Child {
+    Actual(StdChild),
+    #[cfg(test)]
+    Mock(Vec<u8>, bool),
+}
+
+impl Child {
+    fn wait(&mut self) -> io::Result<ExitStatus> {
+        match self {
+            Self::Actual(child) => Ok(ExitStatus(child.wait()?.success())),
+            #[cfg(test)]
+            Self::Mock(_, r) => Ok(ExitStatus(*r)),
+        }
+    }
+
+    fn take_stdout(&mut self) -> ChildStdout {
+        match self {
+            Self::Actual(child) => ChildStdout::Actual(child.stdout.take().unwrap()),
+            #[cfg(test)]
+            Self::Mock(v, _) => ChildStdout::Mock(io::Cursor::new(v.clone())),
+        }
+    }
+}
+
+#[derive(Debug)]
+enum ChildStdout {
+    Actual(StdChildStdout),
+    #[cfg(test)]
+    Mock(std::io::Cursor<Vec<u8>>),
+}
+
+impl io::Read for ChildStdout {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        match self {
+            Self::Actual(stdout) => stdout.read(buf),
+            #[cfg(test)]
+            Self::Mock(v) => v.read(buf),
+        }
+    }
+}
+
 #[derive(Debug)]
 struct Command {
     commands: Vec<String>,
@@ -41,7 +126,7 @@ struct Command {
 
 impl Command {
     fn log(&self) {
-        log::debug!("call {}", self.commands.join(" "));
+        log::debug!("CALL {}", self.commands.join(" "));
     }
 
     fn new(program: impl AsRef<OsStr>) -> Self {
@@ -59,7 +144,7 @@ impl Command {
         self
     }
 
-    fn args(&mut self, args: impl IntoIterator<Item=impl AsRef<OsStr>>) -> &mut Self {
+    fn args(&mut self, args: impl IntoIterator<Item = impl AsRef<OsStr>>) -> &mut Self {
         for arg in args {
             self.arg(arg);
         }
@@ -78,31 +163,58 @@ impl Command {
 
     fn output(&mut self) -> io::Result<Output> {
         self.log();
-        self.inner.output()
+        #[cfg(test)]
+        {
+            if let Some((v, r)) = MOCK_RESULT.with(|o| o.borrow_mut().take()) {
+                return Ok(Output::Mock(v.to_vec(), r));
+            }
+        }
+        Ok(Output::Actual(self.inner.output()?))
     }
 
     fn spawn(&mut self) -> io::Result<Child> {
         self.log();
-        self.inner.spawn()
+        #[cfg(test)]
+        {
+            if let Some((v, r)) = MOCK_RESULT.with(|o| o.borrow_mut().take()) {
+                return Ok(Child::Mock(v.to_vec(), r));
+            }
+        }
+        Ok(Child::Actual(self.inner.spawn()?))
     }
 
     fn status(&mut self) -> io::Result<ExitStatus> {
         self.log();
-        self.inner.status()
+        #[cfg(test)]
+        {
+            if let Some((_, r)) = MOCK_RESULT.with(|o| o.borrow_mut().take()) {
+                return Ok(ExitStatus(r));
+            }
+        }
+        Ok(ExitStatus(self.inner.status()?.success()))
     }
+}
+
+fn cargo() -> PathBuf {
+    let cargo = env::var("CARGO").unwrap_or_else(|_| "cargo".to_owned());
+    cargo.into()
+}
+
+fn cargo_home() -> String {
+    env::var("CARGO_HOME").unwrap_or_default()
+}
+
+fn rustup_home() -> String {
+    env::var("RUSTUP_HOME").unwrap_or_default()
 }
 
 fn target_dir(cargo: &Path) -> anyhow::Result<PathBuf> {
     let metadata = Command::new(cargo).arg("metadata").output()?;
-    let metadata = serde_json::from_slice::<Metadata>(&metadata.stdout)?;
+    let metadata = serde_json::from_slice::<Metadata>(metadata.stdout())?;
     Ok(metadata.target_directory)
 }
 
-fn build(
-    cargo: &Path,
-    target: &Path,
-    profraw: &Path,
-) -> anyhow::Result<Vec<PathBuf>> {
+fn build(cargo: &Path, target: &Path, profraw: &Path) -> anyhow::Result<Vec<PathBuf>> {
     let mut build_proc = Command::new(cargo)
         .arg("build")
         .arg("--message-format")
@@ -118,17 +230,15 @@ fn build(
 
     let mut executables = vec![];
 
-    let stdout = build_proc.stdout.take().unwrap();
+    let stdout = build_proc.take_stdout();
     let stdout = BufReader::new(stdout);
     for line in stdout.lines() {
         let line = line?;
         let line = serde_json::from_str::<BuildMessage>(&line)?;
         if let BuildMessage::CompilerArtifact {
             executable: Some(exe),
-            target:
-                BuildTarget {
-                    test: true,
-                },
+            profile: BuildProfile { test: true },
+            target: BuildTarget { test: true },
         } = line
         {
             executables.push(exe);
@@ -146,17 +256,30 @@ fn build(
     Ok(executables)
 }
 
-fn merge_profdata(profraw: impl AsRef<Path>, profdata: impl AsRef<Path>) -> anyhow::Result<()> {
-    let llvm_profdata = Tool::Profdata.path()?;
+fn run_test(prog: &Path, profraw: &Path) -> anyhow::Result<()> {
+    let r = Command::new(&prog)
+        .arg("--nocapture")
+        .env("LLVM_PROFILE_FILE", profraw)
+        .status()?;
+    if !r.success() {
+        anyhow::bail!("failed to run executable.");
+    }
+    Ok(())
+}
+
+fn merge_profdata<'a, P>(llvm_profdata: &Path, profraws: P, profdata: &Path) -> anyhow::Result<()>
+where
+    P: IntoIterator<Item = &'a PathBuf>,
+{
     let result = Command::new(llvm_profdata)
         .arg("merge")
         .arg("-sparse")
-        .arg(profraw.as_ref())
+        .args(profraws)
         .arg("-o")
-        .arg(profdata.as_ref())
+        .arg(profdata)
         .status()?;
     if !result.success() {
-        anyhow::bail!("failed to run llvm-profdata");
+        anyhow::bail!("failed to run llvm-profdata.");
     }
     Ok(())
 }
@@ -175,6 +298,8 @@ fn to_obj_args<'a>(executables: &'a [PathBuf]) -> Vec<&'a OsStr> {
 }
 
 fn llvm_cov_show(
+    llvm_cov: &Path,
+    rustfilt: &Path,
     profdata: &Path,
     executables: &[PathBuf],
     html_output: Option<&Path>,
@@ -186,10 +311,12 @@ fn llvm_cov_show(
         vec![]
     };
 
-    let llvm_cov = Tool::Cov.path()?;
     let result = Command::new(llvm_cov)
         .arg("show")
-        .arg("-Xdemangler=rustfilt") // TODO
+        .arg(format!(
+            "-Xdemangler={}",
+            rustfilt.to_string_lossy().as_ref()
+        ))
         .args(to_obj_args(executables))
         .arg(format!("-instr-profile={}", profdata.to_string_lossy()))
         .arg(format!(
@@ -205,26 +332,27 @@ fn llvm_cov_show(
         .arg("-show-instantiations=false")
         .status()?;
     if !result.success() {
-        anyhow::bail!("failed to run llvm-cov");
+        anyhow::bail!("failed to run llvm-cov.");
     }
     Ok(())
 }
 
 fn llvm_cov_export(
-    profdata: impl AsRef<Path>,
+    llvm_cov: &Path,
+    rustfilt: &Path,
+    profdata: &Path,
     executables: &[PathBuf],
-    output: impl AsRef<Path>,
+    output: &Path,
     ignore: &str,
 ) -> anyhow::Result<()> {
-    let llvm_cov = Tool::Cov.path()?;
     let result = Command::new(llvm_cov)
         .arg("export")
-        .arg("-Xdemangler=rustfilt") // TODO
-        .args(to_obj_args(executables))
         .arg(format!(
-            "-instr-profile={}",
-            profdata.as_ref().to_string_lossy()
+            "-Xdemangler={}",
+            rustfilt.to_string_lossy().as_ref()
         ))
+        .args(to_obj_args(executables))
+        .arg(format!("-instr-profile={}", profdata.to_string_lossy()))
         .arg("-format=lcov")
         .arg(format!("-ignore-filename-regex={}", ignore))
         .arg("-show-instantiations=false")
@@ -236,12 +364,19 @@ fn llvm_cov_export(
         )
         .status()?;
     if !result.success() {
-        anyhow::bail!("failed to run llvm-cov");
+        anyhow::bail!("failed to run llvm-cov.");
     }
     Ok(())
 }
 
 #[derive(Debug, Clap)]
+#[clap(bin_name = "cargo", version = env!("CARGO_PKG_VERSION"), after_long_help = option_env!("RUSTFLAGS").unwrap_or_default())]
+pub enum SubCommand {
+    Llvmcov(Opts),
+}
+
+#[derive(Debug, Clap)]
+#[clap(version = env!("CARGO_PKG_VERSION"))]
 pub struct Opts {
     #[clap(short = 'l', long, conflicts_with_all = &["html", "lcov-output"])]
     lcov: bool,
@@ -263,60 +398,84 @@ pub struct Opts {
 }
 
 fn main() -> anyhow::Result<()> {
-    let opts = Opts::parse_from(env::args().skip(1));
+    let opts = SubCommand::parse();
+    let SubCommand::Llvmcov(opts) = opts;
 
     stderrlog::new().verbosity(opts.verbose).init()?;
 
-    let cargo = env::var("CARGO").unwrap_or("cargo".to_owned());
-    let cargo = PathBuf::from(cargo);
-    log::debug!("cargo binary: {:?}", cargo);
-
-    let target = target_dir(&cargo)?;
-    let target = target.join("cov");
-    log::debug!("output directory: {:?}", target);
-
-    let profraw = target.join("default.profraw");
-    log::debug!("LLVM_PROFILE_FILE: {:?}", profraw);
+    let cargo = cargo();
+    let target = target_dir(&cargo)?.join("cov");
+    let llvm_profdata = Tool::Profdata.path()?;
+    let llvm_cov = Tool::Cov.path()?;
+    let rustfilt = which::which("rustfilt")?;
+    let profraw_dir = target.join(format!("profraw-{}", process::id()));
+    let profraw = profraw_dir.join("%p.profraw");
     let executables = build(&cargo, &target, &profraw)?;
-    log::debug!("executables: {:?}", executables);
-
-    for executable in &executables {
-        if !Command::new(&executable)
-            .env("LLVM_PROFILE_FILE", &profraw)
-            .status()?
-            .success()
-        {
-            anyhow::bail!("failed to run executable.");
-        }
-    }
-
     let profdata = target.join("default.profdata");
 
-    merge_profdata(&profraw, &profdata)?;
+    log::debug!("cargo binary: {:?}", cargo);
+    log::debug!("output directory: {:?}", target);
+    log::debug!("llvm-profdata: {:?}", llvm_profdata);
+    log::debug!("LLVM_PROFILE_FILE: {:?}", profraw);
+    log::debug!("executables: {:?}", executables);
+
+    fs::create_dir_all(&profraw_dir)?;
+
+    for executable in &executables {
+        run_test(&executable, &profraw)?;
+    }
+
+    let profraws = glob::glob(profraw_dir.join("*.profraw").to_string_lossy().as_ref())?
+        .collect::<Result<Vec<_>, _>>()?;
+    merge_profdata(&llvm_profdata, &profraws, &profdata)?;
+
+    let cargo_home = cargo_home();
+    let rustup_home = rustup_home();
+    let ignore = format!("{}|{}", cargo_home, rustup_home);
 
     log::debug!("generating report..");
-    let cargo_home = env::var("CARGO_HOME").unwrap_or_default();
     match opts {
         Opts { lcov: true, .. } => {
-            llvm_cov_export(&profdata, &executables, &target.join("cov.info"), &cargo_home)?;
+            llvm_cov_export(
+                &llvm_cov,
+                &rustfilt,
+                &profdata,
+                &executables,
+                &target.join("cov.info"),
+                &cargo_home,
+            )?;
         }
         Opts {
             lcov_output: Some(lcov),
             ..
         } => {
-            llvm_cov_export(&profdata, &executables, &lcov, &cargo_home)?;
+            llvm_cov_export(
+                &llvm_cov,
+                &rustfilt,
+                &profdata,
+                &executables,
+                &lcov,
+                &ignore,
+            )?;
         }
         Opts { html: true, .. } => {
-            llvm_cov_show(&profdata, &executables, Some(&target.join("html")), &cargo_home)?;
+            llvm_cov_show(
+                &llvm_cov,
+                &rustfilt,
+                &profdata,
+                &executables,
+                Some(&target.join("html")),
+                &ignore,
+            )?;
         }
         _ => {
-            llvm_cov_show(&profdata, &executables, None, &cargo_home)?;
+            llvm_cov_show(&llvm_cov, &rustfilt, &profdata, &executables, None, &ignore)?;
         }
     }
 
     if !opts.keep {
         log::debug!("remove profraw & profdata");
-        fs::remove_file(&profraw)?;
+        fs::remove_dir_all(&profraw_dir)?;
         fs::remove_file(&profdata)?;
     }
 
