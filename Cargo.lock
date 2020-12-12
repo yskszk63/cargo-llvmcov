@@ -83,6 +83,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf1de2fe8c75bc145a2f577add951f8134889b4795d47466a54a5c846d691693"
 
 [[package]]
+name = "capture-logger"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "605a59c5054ce9e87cd329251bcc4c04579d5edbd206b1e4c45fbfe24b13ff82"
+dependencies = [
+ "log",
+]
+
+[[package]]
 name = "cargo-binutils"
 version = "0.3.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -104,14 +113,13 @@ name = "cargo-llvmcov"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "capture-logger",
  "cargo-binutils",
  "cargo_metadata",
  "clap 3.0.0-beta.2",
  "glob",
  "log",
- "logtest",
  "mktemp",
- "once_cell",
  "opener",
  "serde",
  "serde_json",
@@ -313,16 +321,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "logtest"
-version = "2.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "eb3e43a8657c1d64516dcc9db8ca03826a4aceaf89d5ce1b37b59f6ff0e43026"
-dependencies = [
- "lazy_static",
- "log",
-]
-
-[[package]]
 name = "memchr"
 version = "2.3.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -371,12 +369,6 @@ name = "object"
 version = "0.22.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8d3b63360ec3cb337817c2dbd47ab4a0f170d285d8e5a2064600f3def1402397"
-
-[[package]]
-name = "once_cell"
-version = "1.5.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "13bd41f508810a131401606d54ac32a467c97172d74ba7662562ebba5ad07fa0"
 
 [[package]]
 name = "opener"
